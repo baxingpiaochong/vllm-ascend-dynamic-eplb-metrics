@@ -57,74 +57,15 @@ class ReqMeta:
 
 class KVCacheTaskTracker:
 
-    def __init__(self, tp_rank: int, local_engine_id: str, target_count: int):
+    def __init__(self):
         super().__init__()
-        self.tp_rank = tp_rank
-        self.local_engine_id = local_engine_id
-        self.target_count = target_count
 
         self.done_task_lock = threading.Lock()
-        self.done_task_counts: defaultdict[str, set[int]] = defaultdict(set)
         self.finished_requests: set[str] = set()
 
-        self.socket_path = \
-            f"ipc:///tmp/vllm_mooncake_connector_{self.local_engine_id}.ipc"
-        if tp_rank == 0:
-            self.listener = threading.Thread(
-                target=self._listen_for_completion_signals,
-                daemon=True,
-                name="KVCacheTaskTrackerListenerThread")
-            self.listener.start()
-            self.socket = None
-        else:
-            self.listener = None  # type: ignore
-            self.socket = make_zmq_socket(
-                ctx=zmq.Context(),  # type: ignore
-                path=self.socket_path,
-                socket_type=zmq.PUSH,  # type: ignore
-                bind=False)
-            logger.info("Connecting to transfer socket at %s",
-                        self.socket_path)
-
-    def _listen_for_completion_signals(self):
-        socket = make_zmq_socket(
-            ctx=zmq.Context(),  # type: ignore
-            path=self.socket_path,
-            socket_type=zmq.PULL,  # type: ignore
-            bind=True)
-        logger.info("Listening for completion signals on %s", self.socket_path)
-
-        while True:
-            try:
-                done_request_id, tp_rank = socket.recv_pyobj()
-                logger.debug("Received completion notification for request: "
-                             f"{done_request_id} from tp rank {tp_rank}")
-                self._increment_task_count(done_request_id, tp_rank)
-            except Exception as e:
-                logger.error(f"Error in run_busy_loop: {e}")
-
-    def update_done_task_count(self, request_id: str, tp_rank: int):
-        if self.tp_rank == 0:
-            self._increment_task_count(request_id, tp_rank)
-        else:
-            self.socket.send_pyobj((request_id, tp_rank))  # type: ignore
-            logger.debug("Sent done signal for request %s to tp 0", request_id)
-
-    def _increment_task_count(self, request_id: str, tp_rank: int):
+    def update_done_task_count(self, request_id: str):
         with self.done_task_lock:
-            if tp_rank in self.done_task_counts[request_id]:
-                logger.warning(
-                    f"Received duplicate done signal for request {request_id} "
-                    f"from tp rank {tp_rank}. Ignoring.")
-                return
-
-            self.done_task_counts[request_id].add(tp_rank)
-            if len(self.done_task_counts[request_id]) == self.target_count:
-                self.finished_requests.add(request_id)
-                self.done_task_counts.pop(request_id)
-                logger.info("All transfers completed for request: "
-                            f"{request_id}. Total ranks: "
-                            f"{self.target_count}.")
+            self.finished_requests.add(request_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -153,9 +94,7 @@ class KVCacheSendingThread(threading.Thread):
         self.metadata = metadata
         self.ready_event = ready_event
 
-        self.task_tracker = KVCacheTaskTracker(self.tp_rank,
-                                               self.local_engine_id,
-                                               self.decode_tp_size)
+        self.task_tracker = KVCacheTaskTracker()
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -205,7 +144,7 @@ class KVCacheSendingThread(threading.Thread):
                                      msg[1])
                         request_id, decode_tp_rank = msg[1], msg[2]
                         self.task_tracker.update_done_task_count(
-                            request_id, decode_tp_rank)
+                            request_id)
                         # Acknowledge the request completion.
                         while True:
                             try:
@@ -258,9 +197,7 @@ class KVCacheRecvingThread(threading.Thread):
         # TODO(jianzs): make this configurable
         self.executor = ThreadPoolExecutor(max_workers=32)
 
-        self.task_tracker = KVCacheTaskTracker(self.tp_rank,
-                                               self.local_engine_id,
-                                               self.tp_size)
+        self.task_tracker = KVCacheTaskTracker()
 
         self.encoder = msgspec.msgpack.Encoder()
         self.decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
@@ -322,7 +259,7 @@ class KVCacheRecvingThread(threading.Thread):
             logger.error("Failed to transfer KV cache for request "
                          f"{request_id}: {e}")
         finally:
-            self.task_tracker.update_done_task_count(request_id, self.tp_rank)
+            self.task_tracker.update_done_task_count(request_id)
             # Always send the done signal to the remote host to ensure proper
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
@@ -541,6 +478,10 @@ class MooncakeConnector(KVConnectorBase_V1):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+    
+    def get_finished_count(self) -> tuple[Optional[int], Optional[int]]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_finished_count()
 
     ############################################################
     # Worker Side Methods
@@ -718,6 +659,25 @@ class MooncakeConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
         )
+    
+    def get_finished_count(self) -> tuple[Optional[int], Optional[int]]:
+        prefill_parallel_config: dict[
+            str, Any] = vllm_config.kv_transfer_config.get_from_extra_config(
+                "prefill", {})
+
+        assert "tp_size" in prefill_parallel_config.keys()
+        self._prefill_tp_size = prefill_parallel_config["tp_size"]
+        decode_parallel_config: dict[
+            str, Any] = vllm_config.kv_transfer_config.get_from_extra_config(
+                "decode", {})
+        assert "tp_size" in decode_parallel_config.keys()
+        self._decode_tp_size = decode_parallel_config["tp_size"]
+
+        if vllm_config.model_config.use_mla:
+            return self._decode_tp_size, self._decode_tp_size
+        else:
+            # TODO
+            pass
 
 
 class MooncakeConnectorWorker:
