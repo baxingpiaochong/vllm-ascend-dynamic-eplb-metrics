@@ -520,7 +520,7 @@ class MooncakeConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
     
-    def get_finished_count(self) -> tuple[Optional[int], Optional[int]]:
+    def get_finished_count(self) -> Optional[int]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_finished_count()
 
@@ -701,7 +701,7 @@ class MooncakeConnectorScheduler:
             remote_port=self.side_channel_port,
         )
     
-    def get_finished_count(self) -> tuple[Optional[int], Optional[int]]:
+    def get_finished_count(self) -> Optional[int]:
         prefill_parallel_config: dict[
             str, Any] = self.vllm_config.kv_transfer_config.get_from_extra_config(
                 "prefill", {})
@@ -715,9 +715,9 @@ class MooncakeConnectorScheduler:
         self._decode_tp_size = decode_parallel_config["tp_size"]
 
         if self.vllm_config.model_config.use_mla:
-            return self._decode_tp_size, self._decode_tp_size
+            return self._decode_tp_size
         else:
-            # TODO
+            # TODO support mha and gqa
             pass
 
 
