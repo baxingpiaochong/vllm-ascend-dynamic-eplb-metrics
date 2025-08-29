@@ -29,6 +29,8 @@ from vllm.utils import get_ip, logger, make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
+import vllm_ascend.envs as envs_ascend
+
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
@@ -62,10 +64,16 @@ class KVCacheTaskTracker:
 
         self.done_task_lock = threading.Lock()
         self.finished_requests: set[str] = set()
+        # Only used in prefill node. Tracks requests whose kv blocks freeing is
+        # intentionally delayed. Each entry is a tuple of (request_id,
+        # timestamp). If a request remains in this queue for too long, it will
+        # be force-freed.
+        self.delayed_free_requests: deque[Tuple[str, float]] = deque()
 
     def update_done_task_count(self, request_id: str):
         with self.done_task_lock:
             self.finished_requests.add(request_id)
+            self._remove_delayed_requests(request_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -75,8 +83,38 @@ class KVCacheTaskTracker:
         """
         with self.done_task_lock:
             finished_requests = self.finished_requests.copy()
+            expired_requests = self._retrieve_expired_requests()
+            finished_requests.update(expired_requests)
             self.finished_requests.clear()
         return finished_requests
+    
+    def add_delayed_request(self, request_id: str, delay_start_time: float):
+        """Add a delayed free request."""
+        with self.done_task_lock:
+            self.delayed_free_requests.append((request_id, delay_start_time))
+    
+    def _retrieve_expired_requests(self):
+        """Retrieve all expired delayed requests."""
+        expired_requests: set[str] = set()
+        # Free delayed requests if they exceed the timeout
+        current_time = time.time()
+        while self.delayed_free_requests:
+            request_id, delay_start_time = self.delayed_free_requests[0]
+            if (current_time - delay_start_time > 
+                envs_ascend.VLLM_ASCEND_KVCACHE_DELAY_FREE_TIMEOUT):
+                self.delayed_free_requests.popleft()
+                self.done_task_counts.pop(request_id, None)
+                expired_requests.add(request_id)
+                logger.info("Force freed request: %s", request_id)
+            else:
+                break
+        return expired_requests
+    
+    def _remove_delayed_requests(self, request_id: str):
+        """Remove all delayed free requests matching the given request_id."""
+        self.delayed_free_requests = deque(
+            (r, t) for r, t in self.delayed_free_requests if r != request_id
+        )
 
 
 class KVCacheSendingThread(threading.Thread):
@@ -103,6 +141,9 @@ class KVCacheSendingThread(threading.Thread):
             A set of request IDs that have been completed.
         """
         return self.task_tracker.get_and_clear_finished_requests()
+    
+    def add_delayed_request(self, request_id: str, delay_start_time: float):
+        return self.task_tracker.add_delayed_request(request_id, delay_start_time)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -662,18 +703,18 @@ class MooncakeConnectorScheduler:
     
     def get_finished_count(self) -> tuple[Optional[int], Optional[int]]:
         prefill_parallel_config: dict[
-            str, Any] = vllm_config.kv_transfer_config.get_from_extra_config(
+            str, Any] = self.vllm_config.kv_transfer_config.get_from_extra_config(
                 "prefill", {})
 
         assert "tp_size" in prefill_parallel_config.keys()
         self._prefill_tp_size = prefill_parallel_config["tp_size"]
         decode_parallel_config: dict[
-            str, Any] = vllm_config.kv_transfer_config.get_from_extra_config(
+            str, Any] = self.vllm_config.kv_transfer_config.get_from_extra_config(
                 "decode", {})
         assert "tp_size" in decode_parallel_config.keys()
         self._decode_tp_size = decode_parallel_config["tp_size"]
 
-        if vllm_config.model_config.use_mla:
+        if self.vllm_config.model_config.use_mla:
             return self._decode_tp_size, self._decode_tp_size
         else:
             # TODO
@@ -896,6 +937,10 @@ class MooncakeConnectorWorker:
                 remote_host=meta.remote_host,
                 remote_handshake_port=remote_handshake_port,
             )
+
+            if self.kv_role == 'kv_producer':
+                self.kv_send_thread.add_delayed_request(
+                    req_id, time.time())
 
     def _get_remote_tp_rank(self, req_id: str) -> int:
         return self._get_remote_tp_ranks_for_req(req_id)[self.tp_rank]
